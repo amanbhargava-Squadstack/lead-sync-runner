@@ -1,0 +1,44 @@
+name: Check Status
+# Code lives in this PUBLIC repo; all lead data (leads_archive/) lives in
+# the PRIVATE repo amanbhargava-Squadstack/Swiggy-lead-sync and is only
+# ever committed there. Logs from these runs are public, so the scripts
+# never log names or phone numbers.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this (public) code repo
+        uses: actions/checkout@v4
+
+      - name: Check out the PRIVATE data repo (leads archive)
+        uses: actions/checkout@v4
+        with:
+          repository: amanbhargava-Squadstack/Swiggy-lead-sync
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: private-data
+
+      - name: Point leads_archive/ at the private repo
+        run: |
+          mkdir -p private-data/leads_archive
+          ln -s private-data/leads_archive leads_archive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install paramiko requests
+
+      - name: Report status to Slack
+        env:
+          SQUADSTACK_API_TOKEN: ${{ secrets.SQUADSTACK_API_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python check_status.py

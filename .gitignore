@@ -1,0 +1,7 @@
+# Lead data must NEVER be committed to this public repo.
+leads_archive
+leads_archive/
+private-data/
+swiggy_sync_data/
+*.pem
+*.csv

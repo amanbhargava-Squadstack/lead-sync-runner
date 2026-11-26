@@ -1,0 +1,76 @@
+name: Swiggy Lead Sync
+# Code lives in this PUBLIC repo; all lead data (leads_archive/) lives in
+# the PRIVATE repo amanbhargava-Squadstack/Swiggy-lead-sync and is only
+# ever committed there. Logs from these runs are public, so the scripts
+# never log names or phone numbers.
+
+on:
+  # Started by the Cloudflare Worker cron ("15,20 4-15 * * *" UTC = :45 and
+  # :50 IST, 9:45 AM - 8:50 PM). client_payload.slot = "first" | "followup".
+  repository_dispatch:
+    types: [run_sync]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # this repo is only read; data is written to the private repo
+
+concurrency:
+  group: lead-sync-data   # one job at a time touches the archive
+  cancel-in-progress: false
+
+jobs:
+  sync-leads:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this (public) code repo
+        uses: actions/checkout@v4
+
+      - name: Check out the PRIVATE data repo (leads archive)
+        uses: actions/checkout@v4
+        with:
+          repository: amanbhargava-Squadstack/Swiggy-lead-sync
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: private-data
+
+      - name: Point leads_archive/ at the private repo
+        run: |
+          mkdir -p private-data/leads_archive
+          ln -s private-data/leads_archive leads_archive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install paramiko requests
+
+      - name: Write SFTP private key from secret
+        run: |
+          echo "${{ secrets.SFTP_PRIVATE_KEY }}" > swiggy_sftp_key.pem
+          chmod 600 swiggy_sftp_key.pem
+
+      - name: Run lead sync
+        env:
+          SQUADSTACK_API_TOKEN: ${{ secrets.SQUADSTACK_API_TOKEN }}
+          SFTP_PRIVATE_KEY_PATH: swiggy_sftp_key.pem
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_SLOT: ${{ github.event.client_payload.slot || '' }}
+        run: python swiggy_lead_sync.py
+
+      - name: Save the archive to the PRIVATE data repo
+        if: always()
+        working-directory: private-data
+        run: |
+          git config user.name "swiggy-lead-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add leads_archive/
+          if git diff --cached --quiet; then
+            echo "No archive changes to commit."
+          else
+            git commit -q -m "Update lead archive - run ${{ github.run_id }}"
+            BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            git pull -q --rebase origin "$BRANCH"
+            git push -q origin "$BRANCH"
+            echo "Archive saved to private repo."
+          fi
