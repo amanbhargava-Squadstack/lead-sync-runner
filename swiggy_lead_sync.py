@@ -455,6 +455,29 @@ def load_already_logged_not_pushed_ids() -> set:
     return logged
 
 
+def load_previously_failed_ids() -> set:
+    """
+    Lead IDs archived with status "failed" by an earlier run. These leads
+    are still retried on every run, but a retry that fails AGAIN is not
+    news: it doesn't count as a new lead for Slack, and isn't written to
+    the archive / failed_leads.csv a second time.
+    """
+    failed_ids = set()
+    if not ARCHIVE_DIR.exists():
+        return failed_ids
+    for archive_file in ARCHIVE_DIR.glob("*.csv"):
+        if archive_file.name in (DAILY_SUMMARY_FILE.name, FAILED_LEADS_FILE.name):
+            continue
+        try:
+            with open(archive_file, "r", newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("status") == "failed" and row.get("lead_id"):
+                        failed_ids.add(row["lead_id"])
+        except (OSError, csv.Error) as e:
+            log.warning("Could not read archive file %s while building failed-ids: %s", archive_file, e)
+    return failed_ids
+
+
 # ----------------------------------------------------------------------------
 # STEP 5: Daily lead cap (checked once per run, not per lead - see below)
 # ----------------------------------------------------------------------------
@@ -997,6 +1020,7 @@ def main():
         log.info("Newest data file is from today (%s) - looks fresh.", newest_file_mtime.strftime("%H:%M IST"))
 
     seen_ids = load_seen_ids()
+    previously_failed_ids = load_previously_failed_ids() - seen_ids
     not_pushed_logged_ids = load_already_logged_not_pushed_ids() if is_paused else set()
     daily_state = load_daily_state()
     today_str = daily_state["date"]
@@ -1006,7 +1030,7 @@ def main():
     if is_scheduled:
         new_ids = {
             (r.get("BOOKING_ORDER_ID") or "").strip() for r in rows
-        } - seen_ids - not_pushed_logged_ids - {""}
+        } - seen_ids - not_pushed_logged_ids - previously_failed_ids - {""}
         if new_ids:
             if is_paused:
                 send_slack_alert(
@@ -1026,6 +1050,7 @@ def main():
     handled_this_run = set()
 
     total, pushed, skipped, failed, not_pushed_count = 0, 0, 0, 0, 0
+    retry_failed = 0  # leads that failed in an earlier run and failed again now
 
     with requests.Session() as session:
         for raw_row in rows:
@@ -1069,19 +1094,24 @@ def main():
                 save_daily_state(daily_state)
                 archive_lead_row(today_str, payload, status="pushed")
             else:
+                if booking_id in previously_failed_ids:
+                    # Already reported when it first failed - retry quietly.
+                    retry_failed += 1
+                    log.info("Lead lead_id=%s failed again (already reported earlier).", booking_id)
+                    continue
                 failed += 1
                 archive_lead_row(today_str, payload, status="failed")
                 append_failed_lead(today_str, payload, error_detail)
 
     update_daily_summary(
-        today_str, new_leads=total - skipped, pushed=pushed, capped=0,
+        today_str, new_leads=total - skipped - retry_failed, pushed=pushed, capped=0,
         failed=failed, not_pushed=not_pushed_count
     )
 
     log.info(
         "Run complete. paused=%s total=%s pushed=%s skipped(already seen/logged)=%s failed=%s "
-        "not_pushed(paused)=%s daily_count=%s",
-        is_paused, total, pushed, skipped, failed, not_pushed_count, daily_state["count"]
+        "not_pushed(paused)=%s still_failing_from_earlier=%s daily_count=%s",
+        is_paused, total, pushed, skipped, failed, not_pushed_count, retry_failed, daily_state["count"]
     )
 
     # ---- Decide whether this run posts to Slack -------------------------
@@ -1128,7 +1158,9 @@ def main():
             f"Today's total pushed: {daily_state['count']}",
         ]
         if failed:
-            summary_lines.append(f":x: {failed} lead(s) failed to push this run - check sync.log for details.")
+            summary_lines.append(f":x: {failed} lead(s) failed to push this run - see failed_leads.csv in the private repo.")
+        if retry_failed:
+            summary_lines.append(f"({retry_failed} lead(s) from earlier runs are still failing - already reported.)")
     send_slack_message_with_control_buttons("\n".join(summary_lines))
 
 
